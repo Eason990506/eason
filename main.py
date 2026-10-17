@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 # ==================== 配置 ====================
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY", "SCT440554TBR9un4ZZPUOu6r28LJvNDpY8")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "50"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "8"))
 
 ADX_THRESHOLD = 25
@@ -31,7 +31,7 @@ stats = {
     "short_5_win": 0, "short_5_total": 0,
 }
 
-# 待结算信号列表  [{symbol, direction, price, time, checked_3, checked_5}]
+# 待结算信号
 pending_signals = []
 
 def send_wechat(title: str, content: str):
@@ -50,14 +50,13 @@ def get_winrate_text():
     def rate(w, t):
         return f"{(w / t * 100):.1f}%" if t > 0 else "暂无数据"
     
-    text = f"""
-**当前胜率统计**
+    return f"""
+**累计胜率**
 3分钟多单: {rate(stats['long_3_win'], stats['long_3_total'])} ({stats['long_3_total']}次)
 3分钟空单: {rate(stats['short_3_win'], stats['short_3_total'])} ({stats['short_3_total']}次)
 5分钟多单: {rate(stats['long_5_win'], stats['long_5_total'])} ({stats['long_5_total']}次)
 5分钟空单: {rate(stats['short_5_win'], stats['short_5_total'])} ({stats['short_5_total']}次)
 """
-    return text
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 100):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -151,7 +150,7 @@ def check_signal(symbol: str):
     return None
 
 def update_pending_signals():
-    """检查待结算信号的3分钟和5分钟结果"""
+    """检查并推送3分钟、5分钟结果"""
     global pending_signals, stats
     now = time.time()
     still_pending = []
@@ -160,37 +159,66 @@ def update_pending_signals():
         try:
             current_price = exchange.fetch_ticker(sig["symbol"])['last']
             elapsed = now - sig["time"]
+            direction = sig["direction"]
+            entry_price = sig["price"]
 
-            # 3分钟结算
+            # ===== 3分钟结果 =====
             if not sig["checked_3"] and elapsed >= 180:
-                win = (current_price > sig["price"]) if sig["direction"] == "UP" else (current_price < sig["price"])
-                if sig["direction"] == "UP":
+                win = (current_price > entry_price) if direction == "UP" else (current_price < entry_price)
+                
+                if direction == "UP":
                     stats["long_3_total"] += 1
-                    if win:
-                        stats["long_3_win"] += 1
+                    if win: stats["long_3_win"] += 1
                 else:
                     stats["short_3_total"] += 1
-                    if win:
-                        stats["short_3_win"] += 1
-                sig["checked_3"] = True
-                print(f"{sig['symbol']} 3分钟结果: {'胜' if win else '负'}")
+                    if win: stats["short_3_win"] += 1
 
-            # 5分钟结算
+                result = "胜 ✅" if win else "负 ❌"
+                title = f"3分钟结果：{sig['symbol']} {direction} {result}"
+                content = f"""
+**交易对**: {sig['symbol']}
+**方向**: {direction}
+**入场价**: {entry_price}
+**3分钟后价格**: {current_price}
+**结果**: {result}
+**时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+{get_winrate_text()}
+"""
+                print(title)
+                send_wechat(title, content)
+                sig["checked_3"] = True
+
+            # ===== 5分钟结果 =====
             if not sig["checked_5"] and elapsed >= 300:
-                win = (current_price > sig["price"]) if sig["direction"] == "UP" else (current_price < sig["price"])
-                if sig["direction"] == "UP":
+                win = (current_price > entry_price) if direction == "UP" else (current_price < entry_price)
+                
+                if direction == "UP":
                     stats["long_5_total"] += 1
-                    if win:
-                        stats["long_5_win"] += 1
+                    if win: stats["long_5_win"] += 1
                 else:
                     stats["short_5_total"] += 1
-                    if win:
-                        stats["short_5_win"] += 1
+                    if win: stats["short_5_win"] += 1
+
+                result = "胜 ✅" if win else "负 ❌"
+                title = f"5分钟结果：{sig['symbol']} {direction} {result}"
+                content = f"""
+**交易对**: {sig['symbol']}
+**方向**: {direction}
+**入场价**: {entry_price}
+**5分钟后价格**: {current_price}
+**结果**: {result}
+**时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+{get_winrate_text()}
+"""
+                print(title)
+                send_wechat(title, content)
                 sig["checked_5"] = True
-                print(f"{sig['symbol']} 5分钟结果: {'胜' if win else '负'}")
 
             if not (sig["checked_3"] and sig["checked_5"]):
                 still_pending.append(sig)
+
         except Exception as e:
             print("结算错误:", e)
             still_pending.append(sig)
@@ -199,18 +227,18 @@ def update_pending_signals():
 
 def main():
     print(f"机器人启动 | 交易所: OKX | 监控: {', '.join(SYMBOLS)}")
-    send_wechat("事件合约机器人启动", f"已启动，开始监控 {', '.join(SYMBOLS)}\n\n{get_winrate_text()}")
+    send_wechat("事件合约机器人启动", f"已启动，开始监控 {', '.join(SYMBOLS)}\n\n发出信号后会在3分钟和5分钟自动推送结果")
 
     while True:
-        # 先更新待结算信号
-        update_pending_signals()
+        update_pending_signals()   # 先检查并推送结果
 
         for symbol in SYMBOLS:
             try:
                 signal = check_signal(symbol)
                 if signal:
                     price = exchange.fetch_ticker(symbol)['last']
-                    # 记录待结算信号
+                    
+                    # 加入待结算列表
                     pending_signals.append({
                         "symbol": symbol,
                         "direction": signal,
@@ -228,6 +256,7 @@ def main():
 **时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC
 **建议**: 3-5分钟事件合约
 
+稍后将自动推送3分钟和5分钟结果
 {get_winrate_text()}
 """
                     print(title)
