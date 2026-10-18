@@ -7,7 +7,7 @@ from collections import deque
 # ==================== 配置区 ====================
 SERVERCHAN_SENDKEY = "SCT440554TBR9un4ZZPUOu6r28LJvNDpY8"
 
-SYMBOL = "ETH-USDT"          # 已改为 ETH
+SYMBOL = "BTC-USDT"
 CHECK_INTERVAL = 20
 MIN_BUY_SELL_RATIO = 4.2
 MIN_SELL_BUY_RATIO = 4.2
@@ -22,6 +22,11 @@ NEAR_UPPER_3M  = 0.08
 
 SIGNAL_COOLDOWN = 180
 PRICE_DIFF_LIMIT = 0.15
+
+# 布林带宽度阈值（判断震荡）
+BBW_15_THRESHOLD = 1.8
+BBW_5_THRESHOLD  = 1.5
+BBW_3_THRESHOLD  = 1.2
 
 pending_signals = deque()
 stats_3m = {"win": 0, "total": 0}
@@ -134,6 +139,11 @@ def get_bb_info(interval):
         "df": df
     }
 
+def get_bb_width(bb_info):
+    if bb_info is None or bb_info["mid"] == 0:
+        return 999
+    return (bb_info["upper"] - bb_info["lower"]) / bb_info["mid"] * 100
+
 def check_pending_signals():
     global stats_3m, stats_5m
     now = datetime.now()
@@ -154,12 +164,12 @@ def check_pending_signals():
             sig["checked_3m"] = True
             rate_3m = stats_3m["win"] / stats_3m["total"] * 100 if stats_3m["total"] > 0 else 0
             result = "成功 ✅" if win else "失败 ❌"
-            title = f"【3分钟验证】ETH {direction_text}信号"
+            title = f"【3分钟验证】BTC {direction_text}信号"
             content = f"""
 **验证时间**：{now.strftime('%H:%M:%S')}
 **信号方向**：{direction_text}
-**开仓价格**：{sig['price']:.2f}
-**当前价格**：{current_price:.2f}
+**开仓价格**：{sig['price']:.1f}
+**当前价格**：{current_price:.1f}
 **结果**：{result}
 
 **当前3分钟成功率**：{rate_3m:.1f}%（{stats_3m['win']}/{stats_3m['total']}）
@@ -175,12 +185,12 @@ def check_pending_signals():
             sig["checked_5m"] = True
             rate_5m = stats_5m["win"] / stats_5m["total"] * 100 if stats_5m["total"] > 0 else 0
             result = "成功 ✅" if win else "失败 ❌"
-            title = f"【5分钟验证】ETH {direction_text}信号"
+            title = f"【5分钟验证】BTC {direction_text}信号"
             content = f"""
 **验证时间**：{now.strftime('%H:%M:%S')}
 **信号方向**：{direction_text}
-**开仓价格**：{sig['price']:.2f}
-**当前价格**：{current_price:.2f}
+**开仓价格**：{sig['price']:.1f}
+**当前价格**：{current_price:.1f}
 **结果**：{result}
 
 **当前5分钟成功率**：{rate_5m:.1f}%（{stats_5m['win']}/{stats_5m['total']}）
@@ -200,7 +210,7 @@ def get_success_rate_text():
     return f"3分钟成功率: {rate_3m:.1f}% ({stats_3m['win']}/{stats_3m['total']})\n5分钟成功率: {rate_5m:.1f}% ({stats_5m['win']}/{stats_5m['total']})"
 
 print("=" * 50)
-print("ETH 事件合约信号监控已启动（布林+订单簿+RSI/MACD/Stoch）")
+print("BTC 事件合约信号监控已启动（全周期震荡单独信号 + 震荡/趋势过滤）")
 print("=" * 50)
 
 while True:
@@ -229,7 +239,19 @@ while True:
         dif, dea, hist, prev_hist = calculate_macd(bb_5["df"])
         stoch_k, stoch_d = calculate_stoch(bb_5["df"])
 
-        # ========== 主条件（必须满足才发信号） ==========
+        # ========== 震荡判断 ==========
+        bbw_15 = get_bb_width(bb_15)
+        bbw_5  = get_bb_width(bb_5)
+        bbw_3  = get_bb_width(bb_3)
+
+        is_ranging_15 = bbw_15 < BBW_15_THRESHOLD
+        is_ranging_5  = bbw_5  < BBW_5_THRESHOLD
+        is_ranging_3  = bbw_3  < BBW_3_THRESHOLD
+
+        is_ranging = is_ranging_15
+        is_full_ranging = is_ranging_15 and is_ranging_5 and is_ranging_3
+
+        # ========== 主条件 ==========
         near_lower_15 = bb_15["dist_lower"] < NEAR_LOWER_15M and price < bb_15["mid"]
         near_lower_5  = bb_5["dist_lower"] < NEAR_LOWER_5M
         near_lower_3  = bb_3["dist_lower"] < NEAR_LOWER_3M
@@ -252,16 +274,26 @@ while True:
         long_support_count  = sum([long_rsi_ok, long_macd_ok, long_stoch_ok])
         short_support_count = sum([short_rsi_ok, short_macd_ok, short_stoch_ok])
 
-        # 至少 2 个辅助指标支持才标「强信号」
         long_strong  = long_signal and long_support_count >= 2
         short_strong = short_signal and short_support_count >= 2
 
+        # ========== 发送条件 ==========
+        # 全周期震荡 → 单独高优先级信号
+        can_send_long_full  = long_signal and is_full_ranging
+        can_send_short_full = short_signal and is_full_ranging
+
+        # 普通/强信号（排除全周期震荡，避免重复）
+        can_send_long  = long_signal and (is_ranging or long_strong) and not is_full_ranging
+        can_send_short = short_signal and (is_ranging or short_strong) and not is_full_ranging
+
         rate_text = get_success_rate_text()
-        print(f"[{now_str}] ETH:{price:.2f} | 下轨:{bb_15['dist_lower']:.2f}% | 上轨:{bb_15['dist_upper']:.2f}% | 买/卖:{buy_sell_ratio:.2f} | RSI:{rsi:.1f} | Stoch:{stoch_k:.1f}/{stoch_d:.1f}")
+        range_status = "全周期震荡" if is_full_ranging else ("震荡" if is_ranging else "趋势")
+        print(f"[{now_str}] BTC:{price:.1f} | BBW 15:{bbw_15:.2f}% 5:{bbw_5:.2f}% 3:{bbw_3:.2f}% | {range_status}")
+        print(f"       下轨:{bb_15['dist_lower']:.2f}% 上轨:{bb_15['dist_upper']:.2f}% | 买/卖:{buy_sell_ratio:.2f} | RSI:{rsi:.1f} | Stoch:{stoch_k:.1f}/{stoch_d:.1f}")
         print(f"       多支持:{long_support_count} 空支持:{short_support_count} | {rate_text}")
 
-        # ========== 做多信号 ==========
-        if long_signal:
+        # ========== 做多：全周期震荡单独信号 ==========
+        if can_send_long_full:
             price_diff = abs(price - last_long_price) / price * 100 if last_long_price > 0 else 999
             if (now_ts - last_long_time > SIGNAL_COOLDOWN) and (price_diff > PRICE_DIFF_LIMIT):
                 pending_signals.append({
@@ -271,16 +303,59 @@ while True:
                     "checked_3m": False,
                     "checked_5m": False
                 })
-                strong_tag = "【强信号】" if long_strong else ""
-                title = f"{strong_tag}【ETH做多信号】事件合约看涨"
+                title = "【全周期震荡信号】【BTC做多】事件合约看涨"
                 content = f"""
 **时间**：{now_str}
-**ETH当前价格**：{price:.2f}
+**BTC当前价格**：{price:.1f}
+**信号类型**：全周期震荡（3/5/15分钟布林带全部处于震荡）
+**优先级**：最高
 
 **距离下轨**：
-- 15分钟：{bb_15['dist_lower']:.2f}%
-- 5分钟：{bb_5['dist_lower']:.2f}%
-- 3分钟：{bb_3['dist_lower']:.2f}%
+- 15分钟：{bb_15['dist_lower']:.2f}%（BBW:{bbw_15:.2f}%）
+- 5分钟：{bb_5['dist_lower']:.2f}%（BBW:{bbw_5:.2f}%）
+- 3分钟：{bb_3['dist_lower']:.2f}%（BBW:{bbw_3:.2f}%）
+
+**欧意买/卖比**：{buy_sell_ratio:.2f}
+**RSI**：{rsi:.1f}
+**Stochastic**：{stoch_k:.1f} / {stoch_d:.1f}
+**MACD**：{'金叉/转正' if long_macd_ok else '普通'}
+**辅助支持数**：{long_support_count}/3
+
+**历史成功率**：
+{rate_text}
+
+建议：最小仓位开【看涨】3分钟或5分钟事件合约（全周期震荡高优先级）
+"""
+                send_wechat(title, content)
+                print(f">>> BTC【全周期震荡做多信号】已推送！")
+                last_long_time = now_ts
+                last_long_price = price
+            else:
+                print("（全周期震荡做多信号被防重复过滤）")
+
+        # ========== 做多：普通/强信号 ==========
+        elif can_send_long:
+            price_diff = abs(price - last_long_price) / price * 100 if last_long_price > 0 else 999
+            if (now_ts - last_long_time > SIGNAL_COOLDOWN) and (price_diff > PRICE_DIFF_LIMIT):
+                pending_signals.append({
+                    "time": datetime.now(),
+                    "price": price,
+                    "direction": "long",
+                    "checked_3m": False,
+                    "checked_5m": False
+                })
+                range_tag = "【震荡】" if is_ranging else "【趋势】"
+                strong_tag = "【强信号】" if long_strong else ""
+                title = f"{range_tag}{strong_tag}【BTC做多信号】事件合约看涨"
+                content = f"""
+**时间**：{now_str}
+**BTC当前价格**：{price:.1f}
+**行情状态**：{range_status}
+
+**距离下轨**：
+- 15分钟：{bb_15['dist_lower']:.2f}%（BBW:{bbw_15:.2f}%）
+- 5分钟：{bb_5['dist_lower']:.2f}%（BBW:{bbw_5:.2f}%）
+- 3分钟：{bb_3['dist_lower']:.2f}%（BBW:{bbw_3:.2f}%）
 
 **欧意买/卖比**：{buy_sell_ratio:.2f}
 **RSI**：{rsi:.1f}
@@ -294,14 +369,14 @@ while True:
 建议：最小仓位开【看涨】3分钟或5分钟事件合约
 """
                 send_wechat(title, content)
-                print(f">>> ETH做多信号已推送微信！{'（强信号）' if long_strong else '（普通信号）'}")
+                print(f">>> BTC做多信号已推送！{range_tag}{strong_tag}")
                 last_long_time = now_ts
                 last_long_price = price
             else:
                 print("（做多信号被防重复过滤）")
 
-        # ========== 做空信号 ==========
-        if short_signal:
+        # ========== 做空：全周期震荡单独信号 ==========
+        if can_send_short_full:
             price_diff = abs(price - last_short_price) / price * 100 if last_short_price > 0 else 999
             if (now_ts - last_short_time > SIGNAL_COOLDOWN) and (price_diff > PRICE_DIFF_LIMIT):
                 pending_signals.append({
@@ -311,16 +386,59 @@ while True:
                     "checked_3m": False,
                     "checked_5m": False
                 })
-                strong_tag = "【强信号】" if short_strong else ""
-                title = f"{strong_tag}【ETH做空信号】事件合约看跌"
+                title = "【全周期震荡信号】【BTC做空】事件合约看跌"
                 content = f"""
 **时间**：{now_str}
-**ETH当前价格**：{price:.2f}
+**BTC当前价格**：{price:.1f}
+**信号类型**：全周期震荡（3/5/15分钟布林带全部处于震荡）
+**优先级**：最高
 
 **距离上轨**：
-- 15分钟：{bb_15['dist_upper']:.2f}%
-- 5分钟：{bb_5['dist_upper']:.2f}%
-- 3分钟：{bb_3['dist_upper']:.2f}%
+- 15分钟：{bb_15['dist_upper']:.2f}%（BBW:{bbw_15:.2f}%）
+- 5分钟：{bb_5['dist_upper']:.2f}%（BBW:{bbw_5:.2f}%）
+- 3分钟：{bb_3['dist_upper']:.2f}%（BBW:{bbw_3:.2f}%）
+
+**欧意卖/买比**：{sell_buy_ratio:.2f}
+**RSI**：{rsi:.1f}
+**Stochastic**：{stoch_k:.1f} / {stoch_d:.1f}
+**MACD**：{'死叉/转负' if short_macd_ok else '普通'}
+**辅助支持数**：{short_support_count}/3
+
+**历史成功率**：
+{rate_text}
+
+建议：最小仓位开【看跌】3分钟或5分钟事件合约（全周期震荡高优先级）
+"""
+                send_wechat(title, content)
+                print(f">>> BTC【全周期震荡做空信号】已推送！")
+                last_short_time = now_ts
+                last_short_price = price
+            else:
+                print("（全周期震荡做空信号被防重复过滤）")
+
+        # ========== 做空：普通/强信号 ==========
+        elif can_send_short:
+            price_diff = abs(price - last_short_price) / price * 100 if last_short_price > 0 else 999
+            if (now_ts - last_short_time > SIGNAL_COOLDOWN) and (price_diff > PRICE_DIFF_LIMIT):
+                pending_signals.append({
+                    "time": datetime.now(),
+                    "price": price,
+                    "direction": "short",
+                    "checked_3m": False,
+                    "checked_5m": False
+                })
+                range_tag = "【震荡】" if is_ranging else "【趋势】"
+                strong_tag = "【强信号】" if short_strong else ""
+                title = f"{range_tag}{strong_tag}【BTC做空信号】事件合约看跌"
+                content = f"""
+**时间**：{now_str}
+**BTC当前价格**：{price:.1f}
+**行情状态**：{range_status}
+
+**距离上轨**：
+- 15分钟：{bb_15['dist_upper']:.2f}%（BBW:{bbw_15:.2f}%）
+- 5分钟：{bb_5['dist_upper']:.2f}%（BBW:{bbw_5:.2f}%）
+- 3分钟：{bb_3['dist_upper']:.2f}%（BBW:{bbw_3:.2f}%）
 
 **欧意卖/买比**：{sell_buy_ratio:.2f}
 **RSI**：{rsi:.1f}
@@ -334,13 +452,13 @@ while True:
 建议：最小仓位开【看跌】3分钟或5分钟事件合约
 """
                 send_wechat(title, content)
-                print(f">>> ETH做空信号已推送微信！{'（强信号）' if short_strong else '（普通信号）'}")
+                print(f">>> BTC做空信号已推送！{range_tag}{strong_tag}")
                 last_short_time = now_ts
                 last_short_price = price
             else:
                 print("（做空信号被防重复过滤）")
 
-        if not long_signal and not short_signal:
+        if not (can_send_long_full or can_send_long or can_send_short_full or can_send_short):
             print("暂无信号")
 
     except Exception as e:
